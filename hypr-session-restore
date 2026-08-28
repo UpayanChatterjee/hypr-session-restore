@@ -142,6 +142,11 @@ def relaunch_command(client):
     argv = proc_cmdline(pid)
     if not argv:
         return None
+    # some apps (Discord's updater re-exec) collapse binary+flags into one
+    # /proc/<pid>/cmdline field instead of separate argv entries; split it
+    # back apart before re-joining, or shlex.join quotes it as one bogus path
+    if len(argv) == 1 and " " in argv[0]:
+        argv = shlex.split(argv[0])
     return shlex.join(argv)
 
 

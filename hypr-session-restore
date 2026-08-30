@@ -176,6 +176,12 @@ def save():
         })
         spawned_pids.add(pid)
 
+    # Never overwrite a good session with an empty one. If the daemon saves
+    # right as a power menu closes all windows before shutdown/reboot, the
+    # session file would be wiped; keep the last non-empty snapshot instead.
+    if not windows:
+        return 0
+
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = SESSION_FILE + ".tmp"
     with open(tmp, "w") as f:

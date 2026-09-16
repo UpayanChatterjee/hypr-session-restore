@@ -2,6 +2,8 @@
 """hypr-session-restore — macOS-style "reopen windows on login" for Hyprland 0.55+.
 
 save    - snapshot all mapped windows (workspace, geometry, relaunch command)
+shutdown- save, then let session-keeping apps exit cleanly; run from the
+          power menu in place of save
 restore - relaunch every saved window silently on its original workspace
 daemon  - run `save` every SAVE_INTERVAL seconds as a safety net for
           shutdowns that bypass your power menu (power button, crashes)
@@ -13,9 +15,13 @@ Extra excluded classes:    HYPR_SESSION_EXCLUDE="class1,class2"
 Requires Hyprland >= 0.55 (Lua-era dispatcher syntax).
 """
 
+import glob
 import json
 import os
+import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -26,10 +32,11 @@ STATE_DIR = os.environ.get("HYPR_SESSION_DIR") or os.path.join(
 )
 SESSION_FILE = os.path.join(STATE_DIR, "session.json")
 DISABLE_FLAG = os.path.join(STATE_DIR, "disabled")
+# The daemon overwrites session.json 90 seconds into the next login, so this is
+# the only copy that still answers "what was open when I shut down?".
+LAST_SHUTDOWN_FILE = os.path.join(STATE_DIR, "last-shutdown.json")
 
-# Windows of these classes are never saved/restored. Add anything your
-# autostart already launches (bars, tray bridges, scratchpad daemons, ...)
-# here or via HYPR_SESSION_EXCLUDE="class1,class2".
+# Never saved or restored — add whatever your autostart already launches.
 EXCLUDE_CLASSES = {
     "org.quickshell",
     "xembedsniproxy",
@@ -38,20 +45,55 @@ EXCLUDE_CLASSES |= {
     c.strip() for c in os.environ.get("HYPR_SESSION_EXCLUDE", "").split(",") if c.strip()
 }
 
-# Terminal handling: if a known TUI runs inside, relaunch it in its cwd;
-# otherwise reopen the terminal in the shell's cwd.
-# class -> (binary, cwd flag, exec flag or None)
+# class -> (binary, cwd flag, exec flag). A cwd flag ending in "=" is joined to
+# its value: ghostty silently ignores the separated form.
 TERMINALS = {
     "kitty": ("kitty", "-d", None),
     "foot": ("foot", "-D", None),
     "Alacritty": ("alacritty", "--working-directory", "-e"),
+    "com.mitchellh.ghostty": ("ghostty", "--working-directory=", "-e"),
 }
 TUI_PROGRAMS = {"yazi", "nvim", "vim", "btop", "htop", "ranger", "lf"}
 SHELLS = {"fish", "zsh", "bash", "sh", "nu"}
 
+# An AppImage's mount point gets a fresh random suffix on every launch.
+APPIMAGE_MOUNT_PREFIX = "/tmp/.mount_"
+
+# AppImages prefix the window class; their .desktop entry is not prefixed.
+CLASS_PREFIXES = ("appimagekit-",)
+
+# A service invocation, not a way to reopen the window.
+DBUS_SERVICE_FLAG = "--gapplication-service"
+
+DESKTOP_DIRS = (
+    "~/.local/share/applications",
+    "/usr/local/share/applications",
+    "/usr/share/applications",
+    "~/.local/share/flatpak/exports/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+)
+
+# Without it Chromium calls the kill a crash and asks instead of restoring.
+RESTORE_FLAGS = {
+    "brave-browser": "--restore-last-session",
+    # XWayland reports Chromium; native Wayland chromium or chromium-browser
+    "Chromium": "--restore-last-session",
+    "chromium": "--restore-last-session",
+    "chromium-browser": "--restore-last-session",
+    "google-chrome": "--restore-last-session",
+    "microsoft-edge": "--restore-last-session",
+}
+
+DESKTOP_FIELD_CODES = re.compile(r"%[fFuUdDnNickvm]")
+
+# Browsers persist their own windows; every other app reopens nothing by itself.
+SESSION_KEEPING_CLASSES = frozenset(RESTORE_FLAGS)
+GRACEFUL_QUIT_TIMEOUT = 10
 SAVE_INTERVAL = 60
 DAEMON_INITIAL_DELAY = 90
-SWEEP_TIMEOUT = 20
+# The sweep exits as soon as every window is accounted for, so a long wait is
+# only ever paid by one that never appears.
+SWEEP_TIMEOUT = 30
 SPAWN_STAGGER = 0.3
 
 
@@ -61,7 +103,27 @@ def hyprctl_json(cmd):
 
 
 def dispatch(lua):
-    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True, timeout=10)
+    """Send one Lua dispatch. A dispatcher missing on this Hyprland fails
+    silently otherwise, and the windows just stay where they landed."""
+    done = subprocess.run(["hyprctl", "dispatch", lua],
+                          capture_output=True, text=True, timeout=10)
+    reply = (done.stdout or "").strip()
+    if not reply.startswith("ok"):
+        print(f"hypr-session-restore: dispatch rejected: {reply or 'no reply'}\n"
+              f"  {lua}", file=sys.stderr)
+    return reply.startswith("ok")
+
+
+def lua_eval(lua):
+    """Run Lua inside the compositor. It reaches what no dispatcher exposes:
+    the group object, which takes an existing window."""
+    done = subprocess.run(["hyprctl", "eval", lua],
+                          capture_output=True, text=True, timeout=10)
+    reply = (done.stdout or "").strip()
+    if reply != "ok":
+        print(f"hypr-session-restore: eval rejected: {reply or 'no reply'}\n"
+              f"  {lua}", file=sys.stderr)
+    return reply == "ok"
 
 
 # ---------------------------------------------------------------- /proc utils
@@ -118,6 +180,99 @@ def find_descendant(pid, names, max_depth=5):
 
 # ----------------------------------------------------------------------- save
 
+def is_runnable(path):
+    if os.sep in path:
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+    return shutil.which(path) is not None
+
+
+def unflatten_argv(argv):
+    """Chromium rewrites argv into one blob to set its process title. Split it
+    back only when the first token runs, so real paths with spaces survive."""
+    if len(argv) != 1 or " " not in argv[0]:
+        return argv
+    try:
+        tokens = shlex.split(argv[0])
+    except ValueError:
+        return argv
+    if not tokens or not is_runnable(tokens[0]):
+        return argv
+    return tokens
+
+
+def normalize_class(cls):
+    lowered = cls.lower()
+    for prefix in CLASS_PREFIXES:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix):]
+    return lowered
+
+
+def desktop_command(cls):
+    """Exec line of the .desktop entry for a class — the fallback for windows
+    whose /proc command line cannot be replayed."""
+    wanted = normalize_class(cls)
+    for directory in DESKTOP_DIRS:
+        for path in sorted(glob.glob(os.path.join(os.path.expanduser(directory), "*.desktop"))):
+            entry = read_desktop_entry(path)
+            exec_line = entry.get("exec")
+            if not exec_line:
+                continue
+            names = {os.path.basename(path)[: -len(".desktop")].lower()}
+            if entry.get("startupwmclass"):
+                names.add(entry["startupwmclass"].lower())
+            try:
+                names.add(os.path.basename(shlex.split(exec_line)[0]).lower())
+            except (ValueError, IndexError):
+                pass
+            if wanted in names:
+                return exec_line
+    return None
+
+
+def read_desktop_entry(path):
+    """Keys of the [Desktop Entry] section, lowercased."""
+    entry = {}
+    in_section = False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    in_section = line == "[Desktop Entry]"
+                    continue
+                if not in_section or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                entry.setdefault(key.strip().lower(), value.strip())
+    except OSError:
+        return {}
+    exec_line = entry.get("exec")
+    if exec_line:
+        entry["exec"] = DESKTOP_FIELD_CODES.sub("", exec_line).strip()
+    return entry
+
+
+def is_replayable(cmd):
+    """Rejects what a reboot invalidates: an AppImage's temporary mount path,
+    and a D-Bus activation, which would start a service rather than a window."""
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    if DBUS_SERVICE_FLAG in tokens:
+        return False
+    return not tokens[0].startswith(APPIMAGE_MOUNT_PREFIX) and is_runnable(tokens[0])
+
+
+def terminal_argv(binary, cwd_flag, cwd):
+    if cwd_flag.endswith("="):
+        return [binary, cwd_flag + cwd]
+    return [binary, cwd_flag, cwd]
+
+
 def relaunch_command(client):
     """Build the shell command that recreates this window's process."""
     pid = client["pid"]
@@ -131,22 +286,79 @@ def relaunch_command(client):
             # drop session-specific temp-file args (yazi --cwd-file=...)
             argv = [a for a in argv if not a.startswith("--cwd-file")]
             cwd = proc_cwd(tui) or os.path.expanduser("~")
-            cmd = [binary, cwd_flag, cwd]
+            cmd = terminal_argv(binary, cwd_flag, cwd)
             if exec_flag:
                 cmd.append(exec_flag)
             return shlex.join(cmd + argv)
         sh = find_descendant(pid, SHELLS)
         cwd = (proc_cwd(sh) if sh else None) or proc_cwd(pid) or os.path.expanduser("~")
-        return shlex.join([binary, cwd_flag, cwd])
+        return shlex.join(terminal_argv(binary, cwd_flag, cwd))
 
-    argv = proc_cmdline(pid)
-    if not argv:
+    argv = unflatten_argv(proc_cmdline(pid) or [])
+    cmd = shlex.join(argv) if argv else ""
+    if not is_replayable(cmd):
+        cmd = desktop_command(cls) or ""
+    if not cmd:
         return None
-    return shlex.join(argv)
+    return add_restore_flag(cmd, cls)
+
+
+def add_restore_flag(cmd, cls):
+    flag = RESTORE_FLAGS.get(cls)
+    if not flag or flag in cmd:
+        return cmd
+    return f"{cmd} {flag}"
+
+
+def quit_gracefully(timeout=GRACEFUL_QUIT_TIMEOUT):
+    """SIGTERM the browsers so they write their session out — a plain close
+    hits the "close N tabs?" dialog and they record a crash. Returns the
+    pids still alive when the wait ran out."""
+    pids = set()
+    for c in hyprctl_json("clients"):
+        if c.get("class") in SESSION_KEEPING_CLASSES and c.get("pid", -1) > 0:
+            pids.add(c["pid"])
+    signalled = set()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+        signalled.add(pid)
+    pids = signalled
+
+    deadline = time.time() + timeout
+    while pids and time.time() < deadline:
+        time.sleep(0.25)
+        pids = {pid for pid in pids if os.path.exists(f"/proc/{pid}")}
+    return pids
+
+
+def group_ids(clients):
+    """address -> a stable id per Hyprland group, for groups of two or more."""
+    ids, seen = {}, {}
+    for c in clients:
+        members = tuple(sorted(c.get("grouped") or []))
+        if len(members) < 2:
+            continue
+        ids[c["address"]] = seen.setdefault(members, len(seen))
+    return ids
+
+
+def monitor_names():
+    """Hyprland monitor id -> name. Names are stable across boots; the integer
+    ids are not, so placement records the name."""
+    try:
+        return {m["id"]: m["name"] for m in hyprctl_json("monitors")
+                if "id" in m and "name" in m}
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return {}
 
 
 def save():
     clients = hyprctl_json("clients")
+    group_of = group_ids(clients)
+    names = monitor_names()
     windows = []
     spawned_pids = set()
     for c in clients:
@@ -169,17 +381,26 @@ def save():
             "pinned": c.get("pinned", False),
             "fullscreen": c.get("fullscreen", 0),
             "monitor": c.get("monitor", 0),
+            "monitor_name": names.get(c.get("monitor"), ""),
             "cmd": cmd,
-            # one relaunch per process; extra windows of the same pid are
-            # placed by the sweep pass (single-instance apps reopen them)
-            "spawn": pid not in spawned_pids,
+            # Once per window, except a browser: it reopens its own
+            # remaining windows and a second launch would duplicate them.
+            "spawn": pid not in spawned_pids
+                     or c["class"] not in SESSION_KEEPING_CLASSES,
+            "group": group_of.get(c.get("address")),
         })
         spawned_pids.add(pid)
+
+    # The power menu closes every window before powering off, so a daemon tick
+    # in that gap would blank the snapshot it just took.
+    if not windows and os.path.exists(SESSION_FILE):
+        return None
 
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = SESSION_FILE + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"saved_at": time.time(), "windows": windows}, f, indent=2)
+        json.dump({"saved_at": time.time(), "windows": windows,
+                   "focused_workspace": active_workspace()}, f, indent=2)
     os.replace(tmp, SESSION_FILE)
     return len(windows)
 
@@ -245,6 +466,26 @@ def current_clients():
     }
 
 
+def active_workspace():
+    try:
+        active = hyprctl_json("activeworkspace")
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+    return active.get("id") if isinstance(active, dict) else None
+
+
+def window_workspace(address):
+    client = current_clients().get(address)
+    return client.get("workspace", {}).get("id") if client else None
+
+
+def spawn_order(windows, indices):
+    """Tiled before floating, left to right — the closest to the old tiling."""
+    return sorted(indices, key=lambda i: (
+        windows[i]["workspace"].get("id", 0), windows[i]["floating"],
+        windows[i]["at"][0], windows[i]["at"][1]))
+
+
 def restore():
     if os.path.exists(DISABLE_FLAG):
         return
@@ -253,7 +494,7 @@ def restore():
             session = json.load(f)
     except (OSError, ValueError):
         return
-    windows = session.get("windows", [])
+    windows = [w for w in session.get("windows", []) if w["class"] not in EXCLUDE_CLASSES]
     if not windows:
         return
 
@@ -262,53 +503,119 @@ def restore():
         print("hypr-session-restore: session already populated, aborting", file=sys.stderr)
         return
 
-    # tiled windows first (left-to-right, top-to-bottom approximates the old
-    # tiling), floating after so they stack above
-    order = sorted(
-        range(len(windows)),
-        key=lambda i: (
-            windows[i]["workspace"].get("id", 0),
-            windows[i]["floating"],
-            windows[i]["at"][0],
-            windows[i]["at"][1],
-        ),
-    )
-
-    for i in order:
-        win = windows[i]
+    # Everything is launched before anything is waited for, so a slow app
+    # overlaps with the rest instead of holding up the queue.
+    ordered = [windows[i] for i in spawn_order(windows, range(len(windows)))]
+    for win in ordered:
         if not win["spawn"]:
             continue
         dispatch(f"hl.dsp.exec_cmd({lua_long_str(win['cmd'])}, {exec_rules(win)})")
         time.sleep(SPAWN_STAGGER)
 
-    # Sweep: exec_cmd rules track the spawned PID, so windows from forking /
-    # single-instance apps (and second windows of one process) come up
-    # unplaced. Match them by class and move them silently.
-    pending = [windows[i] for i in order]
+    placed, missing = sweep(ordered, set(initial))
+    for win in missing:
+        print(f"hypr-session-restore: no window turned up for {win['class']}",
+              file=sys.stderr)
+    build_groups(placed)
+
+    # These workspaces bind to no monitor, so at boot they pile onto whichever
+    # one was focused. It is also the only pass left that moves focus.
+    if place_workspaces_on_monitors(windows):
+        refocus(session.get("focused_workspace"))
+
+
+def place_workspaces_on_monitors(windows):
+    if len(hyprctl_json("monitors")) < 2:
+        return 0
+    live = {c["workspace"]["id"] for c in current_clients().values()}
+    want = {}
+    for w in windows:
+        ws = w["workspace"].get("id")
+        monitor = w.get("monitor_name")
+        if monitor and isinstance(ws, int) and ws > 0 and ws in live:
+            want.setdefault(ws, monitor)
+    for ws, monitor in want.items():
+        dispatch(f"hl.dsp.workspace.move({{ workspace = {lua_str(str(ws))}, "
+                 f"monitor = {lua_str(monitor)} }})")
+    return len(want)
+
+
+def sweep(pending, seen):
+    """Place the windows that escaped their exec_cmd rule, which tracks the
+    spawned PID and so misses forking and single-instance apps. Returns the
+    (entry, address) pairs placed, and the entries that never got a window."""
+    pending = list(pending)
+    placed = []
     deadline = time.time() + SWEEP_TIMEOUT
-    seen = set(initial)
     while pending and time.time() < deadline:
         time.sleep(1)
         for addr, client in current_clients().items():
             if addr in seen:
                 continue
-            match = None
-            for win in pending:
-                if win["class"] != client.get("class", ""):
-                    continue
-                match = win
-                if client["workspace"].get("id") == win["workspace"].get("id"):
-                    break  # already in place: prefer this pairing
+            match = pair(pending, client)
             if match is None:
                 continue
             pending.remove(match)
             seen.add(addr)
-            misplaced = client["workspace"].get("id") != match["workspace"].get("id")
-            geometry_off = match["floating"] and (
-                client.get("floating") != match["floating"] or client["at"] != match["at"]
-            )
-            if misplaced or geometry_off or match.get("fullscreen", 0) or match["pinned"]:
+            placed.append((match, addr))
+            # moving one member moves the whole group; a group of one is
+            # still just a window, so place it
+            if len(client.get("grouped") or []) > 1:
+                continue
+            if needs_fixing(match, client):
                 fix_window(match, addr)
+    return placed, pending
+
+
+def build_groups(placed):
+    """Rebuild the saved groups from what the sweep placed. `group:add` takes
+    an existing window, so nothing here needs focus, a direction or a lock."""
+    members = {}
+    for win, address in placed:
+        group = win.get("group")
+        if group is not None:
+            members.setdefault(group, []).append((win, address))
+
+    built = 0
+    for group in sorted(members):
+        # tabs follow where the windows sat, not the order they turned up
+        addresses = [address for _, address in
+                     sorted(members[group], key=lambda member: member[0]["at"])]
+        if len(addresses) < 2:
+            continue
+        anchor = lua_str("address:" + addresses[0])
+        dispatch(f"hl.dsp.group.toggle({{ window = {anchor} }})")
+        for address in addresses[1:]:
+            lua_eval(f"hl.get_window({anchor}).group:add("
+                     f"hl.get_window({lua_str('address:' + address)}))")
+        built += 1
+    return built
+
+
+def pair(pending, client):
+    """The saved entry for this window: same class, its workspace preferred."""
+    match = None
+    for win in pending:
+        if win["class"] != client.get("class", ""):
+            continue
+        match = win
+        if client["workspace"].get("id") == win["workspace"].get("id"):
+            break
+    return match
+
+
+def needs_fixing(win, client):
+    misplaced = client["workspace"].get("id") != win["workspace"].get("id")
+    geometry_off = win["floating"] and (
+        client.get("floating") != win["floating"] or client["at"] != win["at"]
+    )
+    return misplaced or geometry_off or bool(win.get("fullscreen", 0)) or win["pinned"]
+
+
+def refocus(workspace):
+    """Switching to a workspace is a focus action, as in Hyprland's own binds."""
+    if workspace is not None:
+        dispatch(f"hl.dsp.focus({{ workspace = {lua_str(str(workspace))} }})")
 
 
 def daemon():
@@ -325,7 +632,21 @@ def main():
     action = sys.argv[1] if len(sys.argv) > 1 else ""
     if action == "save":
         n = save()
-        print(f"saved {n} windows to {SESSION_FILE}")
+        if n is None:
+            print(f"no windows open, kept previous session in {SESSION_FILE}")
+        else:
+            print(f"saved {n} windows to {SESSION_FILE}")
+    elif action == "shutdown":
+        n = save()
+        print(f"saved {n} windows" if n is not None else "kept previous session")
+        try:
+            shutil.copyfile(SESSION_FILE, LAST_SHUTDOWN_FILE)
+        except OSError as e:
+            print(f"hypr-session-restore: could not keep a copy: {e}",
+                  file=sys.stderr)
+        stubborn = quit_gracefully()
+        print(f"{len(stubborn)} app(s) did not exit in time" if stubborn
+              else "session-keeping apps exited cleanly")
     elif action == "restore":
         restore()
     elif action == "daemon":

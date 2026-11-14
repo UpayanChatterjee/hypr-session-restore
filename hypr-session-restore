@@ -45,6 +45,7 @@ TERMINALS = {
     "kitty": ("kitty", "-d", None),
     "foot": ("foot", "-D", None),
     "Alacritty": ("alacritty", "--working-directory", "-e"),
+    "ghostty": ("ghostty", "--working-directory", "-e"),
 }
 TUI_PROGRAMS = {"yazi", "nvim", "vim", "btop", "htop", "ranger", "lf"}
 SHELLS = {"fish", "zsh", "bash", "sh", "nu"}
